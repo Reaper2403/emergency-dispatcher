@@ -237,10 +237,9 @@ Use the `prepare_*`, `finalize_*`, and `export_*` scripts in [scripts](/Users/as
 
 ## Current Documentation
 
-The repo intentionally keeps the markdown set small:
-- [README.md](/Users/ashutoshchatterjee/Documents/Hackathon/README.md): setup, architecture, and workflows
-- [progress.md](/Users/ashutoshchatterjee/Documents/Hackathon/progress.md): current status and open items
-- [learning.md](/Users/ashutoshchatterjee/Documents/Hackathon/learning.md): distilled lessons and failure modes
+The repo keeps only the active markdown docs:
+- [README.md](/Users/ashutoshchatterjee/Documents/Hackathon/README.md): setup, architecture, runtime modes, and workflows
+- [prompts/dispatcher_system_prompt.md](/Users/ashutoshchatterjee/Documents/Hackathon/prompts/dispatcher_system_prompt.md): active dispatcher runtime instructions
 
 ## Main Known Limits
 

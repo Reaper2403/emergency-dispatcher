@@ -3,15 +3,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import UTC
 from datetime import timedelta
+from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+
+from emergency_dispatcher.berlin_location_lexicon import load_or_build_berlin_location_lexicon
 
 TOOL_SCHEMA_VERSION = "v2"
 ISSUE_TYPES = ("MEDICAL", "FIRE", "TRAFFIC", "POLICE", "HAZMAT", "GENERAL")
@@ -97,14 +102,47 @@ PLACE_DESCRIPTOR_PATTERN = re.compile(
     r"\b(?:campus|station|bahnhof|hospital|clinic|school|airport|bridge|junction|intersection|exit|mall|park|tower|hotel|museum|stadium|plaza|square|terminal|center|centre)\b",
     re.IGNORECASE,
 )
+PLACE_ANCHOR_PATTERN = re.compile(
+    r"\b((?:[A-Za-zÀ-ÿ0-9.'-]+\s+){0,3}(?:campus|station|bahnhof|hospital|clinic|school|airport|bridge|junction|mall|park|tower|hotel|museum|stadium|plaza|square|terminal|center|centre))\b",
+    re.IGNORECASE,
+)
 STREET_DESCRIPTOR_PATTERN = re.compile(
     r"\b(?:street|st\.?|road|rd\.?|avenue|ave\.?|lane|ln\.?|drive|dr\.?|boulevard|blvd\.?|way|straße|strasse|platz|allee|ring|ufer|damm)\b",
+    re.IGNORECASE,
+)
+STREET_ANCHOR_PATTERN = re.compile(
+    r"\b((?:[A-Za-zÀ-ÿ0-9.'-]+\s+){0,3}[A-Za-zÀ-ÿ0-9.'-]*(?:straße|strasse|platz|allee|ring|ufer|damm))\b",
     re.IGNORECASE,
 )
 STREET_NAME_SUFFIX_PATTERN = re.compile(
     r"\b[\w.\-']*(?:straße|strasse|platz|allee|ring|ufer|damm)\b",
     re.IGNORECASE,
 )
+BARE_STREET_SUFFIX_TOKENS = {"straße", "strasse", "platz", "allee", "ring", "ufer", "damm"}
+BARE_PLACE_DESCRIPTOR_TOKENS = {
+    "campus",
+    "station",
+    "bahnhof",
+    "hospital",
+    "clinic",
+    "school",
+    "airport",
+    "bridge",
+    "junction",
+    "intersection",
+    "exit",
+    "mall",
+    "park",
+    "tower",
+    "hotel",
+    "museum",
+    "stadium",
+    "plaza",
+    "square",
+    "terminal",
+    "center",
+    "centre",
+}
 GENERIC_LOCATION_PHRASES = {
     "middle of the street",
     "in the middle of the street",
@@ -183,10 +221,294 @@ SUB_LOCATION_PATTERN = re.compile(
     r"\b(floor|room|unit|apartment|flat|stairwell|lobby|corridor|basement|entrance|gate|wing|level)\b",
     re.IGNORECASE,
 )
+SEMANTIC_STREET_SUFFIXES = {
+    "strasse",
+    "platz",
+    "allee",
+    "ring",
+    "ufer",
+    "damm",
+}
+SEMANTIC_PLACE_SUFFIXES = {
+    "park",
+    "feld",
+    "campus",
+    "station",
+    "bahnhof",
+    "hospital",
+    "clinic",
+    "school",
+    "airport",
+    "bridge",
+    "junction",
+    "mall",
+    "tower",
+    "hotel",
+    "museum",
+    "stadium",
+    "plaza",
+    "square",
+    "terminal",
+    "center",
+    "centre",
+}
+SEMANTIC_LOCATION_PREFIX_PATTERN = re.compile(
+    r"^(?:"
+    r"i am (?:at|close to)|"
+    r"i'm (?:at|close to)|"
+    r"caller says they are (?:at|close to)|"
+    r"close to|near|at|by|inside|outside|around|toward|towards|"
+    r"please\s+|find\s+|search(?:\s+for)?\s+|look up\s+|locate\s+|pin\s+|"
+    r"send help to\s+|route to\s+"
+    r")+",
+    re.IGNORECASE,
+)
 
 
 def _normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _normalize_semantic_location_text(value: str | None) -> str:
+    text = _normalize_whitespace(value or "").casefold()
+    if not text:
+        return ""
+    text = SEMANTIC_LOCATION_PREFIX_PATTERN.sub("", text)
+    replacements = {
+        "ß": "ss",
+        "strasser": "strasse",
+        "strassen": "strasse",
+        "strase": "strasse",
+        "strasze": "strasse",
+        "straße": "strasse",
+        "str.": "strasse",
+        "street": "strasse",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    for suffix in sorted(SEMANTIC_STREET_SUFFIXES | SEMANTIC_PLACE_SUFFIXES, key=len, reverse=True):
+        text = re.sub(rf"(?<=[a-z0-9]){suffix}\b", f" {suffix}", text)
+    text = _normalize_whitespace(text)
+    text = re.sub(r"\bberlin\b$", "", text).strip()
+    return _normalize_whitespace(text)
+
+
+def _semantic_location_stem_and_suffix(value: str) -> tuple[str, str | None]:
+    tokens = value.split()
+    if tokens and tokens[-1] in SEMANTIC_STREET_SUFFIXES | SEMANTIC_PLACE_SUFFIXES:
+        return " ".join(tokens[:-1]), tokens[-1]
+    return value, None
+
+
+def _semantic_alpha_prefix(value: str, *, length: int = 3) -> str:
+    letters = "".join(char for char in value if char.isalpha())
+    return letters[:length]
+
+
+@lru_cache(maxsize=1)
+def _load_berlin_location_semantic_entries() -> tuple[dict[str, Any], ...]:
+    try:
+        lexicon = load_or_build_berlin_location_lexicon()
+    except FileNotFoundError:
+        return ()
+
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in lexicon.get("streets", []):
+        name = _normalize_whitespace(str(row.get("street") or ""))
+        if not name:
+            continue
+        key = ("street", name.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized = _normalize_semantic_location_text(name)
+        stem, suffix = _semantic_location_stem_and_suffix(normalized)
+        entries.append(
+            {
+                "kind": "street",
+                "candidate": name,
+                "normalized": normalized,
+                "compact": normalized.replace(" ", ""),
+                "stem": stem.replace(" ", ""),
+                "suffix": suffix,
+            }
+        )
+    for name in lexicon.get("place_names", []):
+        candidate = _normalize_whitespace(str(name or ""))
+        if not candidate:
+            continue
+        key = ("place", candidate.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized = _normalize_semantic_location_text(candidate)
+        stem, suffix = _semantic_location_stem_and_suffix(normalized)
+        entries.append(
+            {
+                "kind": "place",
+                "candidate": candidate,
+                "normalized": normalized,
+                "compact": normalized.replace(" ", ""),
+                "stem": stem.replace(" ", ""),
+                "suffix": suffix,
+            }
+        )
+    return tuple(entries)
+
+
+@lru_cache(maxsize=1)
+def _load_berlin_location_semantic_index() -> dict[str, Any]:
+    entries = _load_berlin_location_semantic_entries()
+    by_suffix_prefix: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
+    by_suffix: dict[str | None, list[dict[str, Any]]] = {}
+    by_prefix: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        suffix = entry["suffix"]
+        stem = entry["stem"] or entry["compact"]
+        prefix1 = _semantic_alpha_prefix(stem, length=1)
+        prefix2 = _semantic_alpha_prefix(stem, length=2)
+        by_suffix.setdefault(suffix, []).append(entry)
+        for prefix in {prefix1, prefix2} - {""}:
+            by_suffix_prefix.setdefault((suffix, prefix), []).append(entry)
+            by_prefix.setdefault(prefix, []).append(entry)
+    return {
+        "entries": entries,
+        "by_suffix_prefix": by_suffix_prefix,
+        "by_suffix": by_suffix,
+        "by_prefix": by_prefix,
+    }
+
+
+def _semantic_location_score(query: str, entry: dict[str, Any]) -> float:
+    normalized_query = _normalize_semantic_location_text(query)
+    if not normalized_query:
+        return 0.0
+    query_compact = normalized_query.replace(" ", "")
+    query_stem, query_suffix = _semantic_location_stem_and_suffix(normalized_query)
+    query_stem = query_stem.replace(" ", "")
+
+    base_score = max(
+        SequenceMatcher(None, normalized_query, entry["normalized"]).ratio(),
+        SequenceMatcher(None, query_compact, entry["compact"]).ratio(),
+    )
+    stem_score = SequenceMatcher(None, query_stem, entry["stem"]).ratio() if query_stem and entry["stem"] else 0.0
+    suffix_bonus = 0.06 if query_suffix and query_suffix == entry["suffix"] else 0.0
+    prefix_bonus = 0.04 if entry["normalized"].startswith(normalized_query) or normalized_query.startswith(entry["normalized"]) else 0.0
+    contains_bonus = 0.05 if query_stem and query_stem in entry["stem"] else 0.0
+    return max(base_score, 0.72 * base_score + 0.28 * stem_score + suffix_bonus + prefix_bonus + contains_bonus)
+
+
+def _semantic_location_match_is_strong(
+    query: str,
+    top_match: dict[str, Any],
+    runner_up_score: float | None,
+) -> bool:
+    score = float(top_match.get("score") or 0.0)
+    if score >= 0.93:
+        return True
+
+    normalized_query = _normalize_semantic_location_text(query)
+    query_stem, query_suffix = _semantic_location_stem_and_suffix(normalized_query)
+    candidate_stem, candidate_suffix = _semantic_location_stem_and_suffix(top_match.get("normalized") or "")
+    if (
+        score >= 0.84
+        and _semantic_alpha_prefix(query_stem) == _semantic_alpha_prefix(candidate_stem)
+        and (not query_suffix or query_suffix == candidate_suffix)
+    ):
+        return True
+
+    if runner_up_score is not None and score >= 0.9 and score - runner_up_score >= 0.08:
+        return True
+    return False
+
+
+def _semantic_match_berlin_location(query: str | None) -> dict[str, Any] | None:
+    normalized_query = _normalize_semantic_location_text(query)
+    if not normalized_query or len(normalized_query) < 5 or any(char.isdigit() for char in normalized_query):
+        return None
+
+    index = _load_berlin_location_semantic_index()
+    entries = index["entries"]
+    if not entries:
+        return None
+
+    query_stem, query_suffix = _semantic_location_stem_and_suffix(normalized_query)
+    stem_key = query_stem.replace(" ", "") or normalized_query.replace(" ", "")
+    prefix2 = _semantic_alpha_prefix(stem_key, length=2)
+    prefix1 = _semantic_alpha_prefix(stem_key, length=1)
+    candidates = list(index["by_suffix_prefix"].get((query_suffix, prefix2), ()))
+    if len(candidates) < 12 and prefix1:
+        candidates.extend(index["by_suffix_prefix"].get((query_suffix, prefix1), ()))
+    if len(candidates) < 12:
+        candidates.extend(index["by_suffix"].get(query_suffix, ()))
+    if len(candidates) < 12:
+        if prefix2:
+            candidates.extend(index["by_prefix"].get(prefix2, ()))
+        if len(candidates) < 12 and prefix1:
+            candidates.extend(index["by_prefix"].get(prefix1, ()))
+    if not candidates:
+        candidates = list(entries)
+
+    deduped_candidates: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+    for candidate in candidates:
+        key = f"{candidate['kind']}:{candidate['candidate']}".casefold()
+        if key in seen_candidates:
+            continue
+        seen_candidates.add(key)
+        deduped_candidates.append(candidate)
+
+    scored = sorted(
+        (
+            {
+                "kind": entry["kind"],
+                "candidate": entry["candidate"],
+                "normalized": entry["normalized"],
+                "score": _semantic_location_score(normalized_query, entry),
+            }
+            for entry in deduped_candidates
+        ),
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+    if not scored:
+        return None
+
+    top_match = scored[0]
+    runner_up = scored[1] if len(scored) > 1 else None
+    runner_up_score = float(runner_up["score"]) if runner_up else None
+    strong = _semantic_location_match_is_strong(normalized_query, top_match, runner_up_score)
+    return {
+        "query": _normalize_whitespace(query or "") or None,
+        "normalized_query": normalized_query,
+        "candidate": top_match["candidate"],
+        "kind": top_match["kind"],
+        "score": round(float(top_match["score"]), 3),
+        "runner_up_candidate": runner_up["candidate"] if runner_up else None,
+        "runner_up_score": round(runner_up_score, 3) if runner_up_score is not None else None,
+        "apply": strong,
+        "source": "berlin_lexicon",
+    }
+
+
+def _meaningful_street_suffix_query(value: str) -> bool:
+    match = STREET_ANCHOR_PATTERN.search(value or "")
+    if not match:
+        return False
+    token = _normalize_whitespace(match.group(1)).casefold()
+    return token not in BARE_STREET_SUFFIX_TOKENS
+
+
+def _meaningful_place_anchor_query(value: str) -> bool:
+    match = PLACE_ANCHOR_PATTERN.search(value or "")
+    if not match:
+        return False
+    token = _normalize_whitespace(match.group(1)).casefold()
+    return token not in BARE_PLACE_DESCRIPTOR_TOKENS
 
 
 def _normalize_label(value: str | None) -> str:
@@ -349,15 +671,42 @@ def _extract_anchor_from_location_note(note: str | None) -> str | None:
     normalized = _normalize_whitespace(note or "")
     if not normalized:
         return None
+    normalized = re.sub(
+        r"^(?:please\s+)?(?:find|search(?: for)?|look up|locate|pin|send help to|route to)\s+",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
     explicit = extract_address_candidate(normalized)
     if explicit:
         return explicit
-    suffix_match = STREET_NAME_SUFFIX_PATTERN.search(normalized)
+    suffix_match = STREET_ANCHOR_PATTERN.search(normalized)
     if suffix_match:
-        return _normalize_whitespace(suffix_match.group(0))
+        candidate = _normalize_whitespace(
+            re.sub(
+                r"^(?:right now\s+|now\s+)?(?:near|close to|around|by|outside|inside|at)\s+",
+                "",
+                suffix_match.group(1),
+                flags=re.IGNORECASE,
+            )
+        )
+        if _meaningful_street_suffix_query(candidate):
+            return candidate
     road_match = ROAD_TOKEN_PATTERN.search(normalized)
     if road_match:
         return _normalize_whitespace(road_match.group(0))
+    place_match = PLACE_ANCHOR_PATTERN.search(normalized)
+    if place_match:
+        candidate = _normalize_whitespace(
+            re.sub(
+                r"^(?:(?:right now|now)\s+)?(?:near|close to|around|by|outside|inside|at|please\s+|find\s+|search(?: for)?\s+|look up\s+|locate\s+|pin\s+|send help to\s+|route to\s+)+",
+                "",
+                place_match.group(1),
+                flags=re.IGNORECASE,
+            )
+        )
+        if _meaningful_place_anchor_query(candidate):
+            return candidate
     return None
 
 
@@ -1144,15 +1493,22 @@ def assess_searchable_location_query(address_text: str | None) -> tuple[bool, st
             return False, "location_not_specific_enough"
     if re.search(r"\b\d{1,5}[a-z]?\b", lowered) and STREET_DESCRIPTOR_PATTERN.search(lowered):
         return True, "street_number"
-    if STREET_NAME_SUFFIX_PATTERN.search(lowered):
+    if _meaningful_street_suffix_query(lowered):
         return True, "street_name_suffix"
 
     # Reject location phrases that are only generic containers like "middle of the street".
     tokens = [token for token in re.split(r"[\s,./-]+", lowered) if token]
-    non_generic_tokens = [token for token in tokens if token not in GENERIC_LOCATION_TOKENS and len(token) > 1]
+    non_generic_tokens = [
+        token
+        for token in tokens
+        if token not in GENERIC_LOCATION_TOKENS
+        and token not in BARE_STREET_SUFFIX_TOKENS
+        and token not in BARE_PLACE_DESCRIPTOR_TOKENS
+        and len(token) > 1
+    ]
     if STREET_DESCRIPTOR_PATTERN.search(lowered) and non_generic_tokens:
         return True, "street_name"
-    if PLACE_DESCRIPTOR_PATTERN.search(lowered) and non_generic_tokens:
+    if _meaningful_place_anchor_query(lowered) and PLACE_DESCRIPTOR_PATTERN.search(lowered) and non_generic_tokens:
         return True, "named_place"
     if non_generic_tokens and any(char.isdigit() for char in lowered):
         return True, "mixed_named_location"
@@ -1554,7 +1910,7 @@ def _build_location_context(geocode_result: dict[str, Any]) -> dict[str, Any] | 
     }
 
 
-def _geocode_address(address_text: str | None) -> dict[str, Any]:
+def _geocode_address(address_text: str | None, *, allow_best_effort: bool = False) -> dict[str, Any]:
     if not address_text:
         return {
             "valid": False,
@@ -1588,7 +1944,7 @@ def _geocode_address(address_text: str | None) -> dict[str, Any]:
             "candidates": [],
         }
     allowed, location_reason = assess_searchable_location_query(normalized)
-    if not allowed:
+    if not allowed and not allow_best_effort:
         return {
             "valid": False,
             "found": False,
@@ -1602,64 +1958,82 @@ def _geocode_address(address_text: str | None) -> dict[str, Any]:
             "confidence": None,
             "reason": location_reason,
             "candidates": [],
+            "semantic_match": None,
         }
 
-    try:
-        google_candidates = _google_geocode_candidates(normalized)
-    except httpx.HTTPError:
-        google_candidates = []
+    semantic_match = None
+    queries_to_try = [normalized]
+    if allow_best_effort:
+        semantic_match = _semantic_match_berlin_location(normalized)
+        semantic_candidate = _normalize_whitespace(str((semantic_match or {}).get("candidate") or ""))
+        if semantic_candidate and (semantic_match or {}).get("apply") and semantic_candidate.casefold() != normalized.casefold():
+            queries_to_try = [semantic_candidate, normalized]
 
-    if google_candidates:
-        simplified_google_candidates = [_simplify_google_candidate(item) for item in google_candidates]
-        filtered_google_candidates = [
-            item for item in simplified_google_candidates if not _reject_generic_google_match(normalized, item)
-        ]
-        if not filtered_google_candidates:
+    saw_nominatim_error = False
+    for query in queries_to_try:
+        try:
+            google_candidates = _google_geocode_candidates(query)
+        except httpx.HTTPError:
             google_candidates = []
-        else:
-            candidate_list = [dict(item) for item in filtered_google_candidates]
-            best = dict(candidate_list[0])
+
+        if google_candidates:
+            simplified_google_candidates = [_simplify_google_candidate(item) for item in google_candidates]
+            filtered_google_candidates = [
+                item for item in simplified_google_candidates if not _reject_generic_google_match(query, item)
+            ]
+            if filtered_google_candidates:
+                candidate_list = [dict(item) for item in filtered_google_candidates]
+                best = dict(candidate_list[0])
+                best.update(
+                    {
+                        "valid": True,
+                        "found": True,
+                        "geocoded": True,
+                        "normalized_address": best["display_name"],
+                        "source": "google_geocoding",
+                        "reason": "google_match",
+                        "candidates": candidate_list,
+                        "semantic_match": semantic_match,
+                    }
+                )
+                return best
+
+        try:
+            candidates = _nominatim_candidates(query)
+        except httpx.HTTPError:
+            saw_nominatim_error = True
+            continue
+
+        if candidates:
+            best = _simplify_candidate(candidates[0])
             best.update(
                 {
                     "valid": True,
                     "found": True,
                     "geocoded": True,
                     "normalized_address": best["display_name"],
-                    "source": "google_geocoding",
-                    "reason": "google_match",
-                    "candidates": candidate_list,
+                    "source": "nominatim",
+                    "confidence": "high" if len(candidates) == 1 else "medium",
+                    "reason": "nominatim_match",
+                    "candidates": [_simplify_candidate(item) for item in candidates],
+                    "semantic_match": semantic_match,
                 }
             )
             return best
 
-    try:
-        candidates = _nominatim_candidates(normalized)
-    except httpx.HTTPError:
-        reason = "google_no_match_nominatim_error" if _google_maps_api_key() else "nominatim_error"
-        return _address_fallback(normalized, reason=reason)
-
-    if not candidates:
-        reason = "google_no_match_nominatim_no_match" if _google_maps_api_key() else "nominatim_no_match"
-        return _address_fallback(normalized, reason=reason)
-
-    best = _simplify_candidate(candidates[0])
-    best.update(
-        {
-            "valid": True,
-            "found": True,
-            "geocoded": True,
-            "normalized_address": best["display_name"],
-            "source": "nominatim",
-            "confidence": "high" if len(candidates) == 1 else "medium",
-            "reason": "nominatim_match",
-            "candidates": [_simplify_candidate(item) for item in candidates],
-        }
-    )
-    return best
+    if saw_nominatim_error:
+        fallback = _address_fallback(normalized, reason="google_no_match_nominatim_error" if _google_maps_api_key() else "nominatim_error")
+    else:
+        fallback = _address_fallback(
+            normalized,
+            reason="google_no_match_nominatim_no_match" if _google_maps_api_key() else "nominatim_no_match",
+        )
+    fallback["semantic_match"] = semantic_match
+    return fallback
 
 
-def validate_address(address_text: str | None) -> dict[str, Any]:
-    result = _geocode_address(address_text)
+def validate_address(address_text: str | None, *, allow_best_effort: bool = False) -> dict[str, Any]:
+    result = _geocode_address(address_text, allow_best_effort=allow_best_effort)
     return {
         "valid": result["valid"],
         "geocoded": result["geocoded"],
@@ -1671,11 +2045,12 @@ def validate_address(address_text: str | None) -> dict[str, Any]:
         "source": result["source"],
         "confidence": result["confidence"],
         "reason": result["reason"],
+        "semantic_match": result.get("semantic_match"),
     }
 
 
-def lookup_address(address_text: str | None) -> dict[str, Any]:
-    result = _geocode_address(address_text)
+def lookup_address(address_text: str | None, *, allow_best_effort: bool = False) -> dict[str, Any]:
+    result = _geocode_address(address_text, allow_best_effort=allow_best_effort)
     return {
         "found": result["found"],
         "geocoded": result["geocoded"],
@@ -1689,6 +2064,7 @@ def lookup_address(address_text: str | None) -> dict[str, Any]:
         "reason": result["reason"],
         "candidates": result["candidates"],
         "location_context": _build_location_context(result) if result["geocoded"] else None,
+        "semantic_match": result.get("semantic_match"),
     }
 
 
@@ -1841,8 +2217,33 @@ def _fact_ledger_schema_properties() -> dict[str, Any]:
     }
 
 
-def build_gradbot_tool_defs() -> list[tuple[str, str, str]]:
-    return [
+def update_soft_ledger(args: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+    payload = {**(args or {}), **kwargs}
+    notes = [
+        _normalize_whitespace(str(item))
+        for item in list(payload.get("notes") or [])
+        if _normalize_whitespace(str(item))
+    ]
+    return {
+        "soft_state": {
+            "people_count_best_guess": payload.get("people_count_best_guess"),
+            "caller_role": _normalize_whitespace(str(payload.get("caller_role") or "unknown")) or "unknown",
+            "notes": notes,
+        },
+        "updated_fields": [
+            field_name
+            for field_name, value in {
+                "people_count_best_guess": payload.get("people_count_best_guess"),
+                "caller_role": payload.get("caller_role"),
+                "notes": notes,
+            }.items()
+            if value not in (None, "", [])
+        ],
+    }
+
+
+def build_gradbot_tool_defs(*, include_soft_ledger: bool = False) -> list[tuple[str, str, str]]:
+    tool_defs: list[tuple[str, str, str]] = [
         (
             "resolve_location_note",
             "First-choice hard-fact tool for location clues that are not exact addresses. Use it as soon as the caller mentions a landmark, entrance, floor, room, stairwell, gate, or relative clue like behind the church. This preserves the clue without pretending it is geocoded.",
@@ -1952,6 +2353,24 @@ def build_gradbot_tool_defs() -> list[tuple[str, str, str]]:
             ),
         ),
     ]
+    if include_soft_ledger:
+        tool_defs.append(
+            (
+                "update_soft_ledger",
+                "Use only for soft guesses or conversational context that should not overwrite confirmed hard facts. Allowed fields are people_count_best_guess, caller_role, and notes.",
+                json.dumps(
+                    {
+                        "type": "object",
+                        "properties": {
+                            "people_count_best_guess": {"type": ["integer", "null"]},
+                            "caller_role": {"type": ["string", "null"]},
+                            "notes": {"type": "array", "items": {"type": "string"}},
+                        },
+                    }
+                ),
+            )
+        )
+    return tool_defs
 
 
 def dispatch_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -1998,9 +2417,15 @@ def dispatch_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         brief_args.pop("caller_summary", None)
         return build_handoff_brief(caller_summary=caller_summary, args=brief_args)
     if name == "validate_address":
-        return validate_address(args.get("address_text"))
+        return validate_address(
+            args.get("address_text"),
+            allow_best_effort=bool(args.get("allow_best_effort")),
+        )
     if name == "lookup_address":
-        return lookup_address(args.get("address_text"))
+        return lookup_address(
+            args.get("address_text"),
+            allow_best_effort=bool(args.get("allow_best_effort")),
+        )
     if name == "create_incident_ticket":
         return create_incident_ticket(
             caller_summary=args["caller_summary"],
@@ -2009,4 +2434,6 @@ def dispatch_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             priority=args["priority"],
             notes=list(args.get("notes", [])),
         )
+    if name == "update_soft_ledger":
+        return update_soft_ledger(args)
     raise KeyError(f"Unknown tool: {name}")

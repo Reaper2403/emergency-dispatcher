@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .settings import REPO_ROOT
+from .slm_fact_ledger import empty_shared_ledger
 
 
 SESSION_DIR = REPO_ROOT / "runs" / "sessions"
@@ -42,6 +43,8 @@ def _read_session(session_id: str) -> dict[str, Any]:
             "llm_prompt_snapshots": [],
             "dispatch_services": {},
             "dispatch_prompt_context": {},
+            "shared_ledger": empty_shared_ledger(),
+            "ledger_prompt_context": {},
         }
     return json.loads(path.read_text(encoding="utf-8"))
 

@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     triage_api_key: str | None = Field(None, alias="TRIAGE_API_KEY")
     triage_base_url: str = Field("https://api.pioneer.ai/v1", alias="TRIAGE_BASE_URL")
     triage_decoder_model: str | None = Field(None, alias="TRIAGE_DECODER_MODEL")
+    live_fact_ledger_model: str | None = Field(None, alias="LIVE_FACT_LEDGER_MODEL")
     triage_gliner_model: str | None = Field(None, alias="TRIAGE_GLINER_MODEL")
     triage_gliner_live_enabled: bool = Field(False, alias="TRIAGE_GLINER_LIVE_ENABLED")
     triage_gliner_timeout_s: float = Field(2.0, alias="TRIAGE_GLINER_TIMEOUT_S")

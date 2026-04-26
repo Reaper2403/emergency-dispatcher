@@ -17,8 +17,8 @@ def load_dispatch_prompt() -> str:
 
 def _adaptive_turn_settings(interrupt_count: int) -> tuple[float, float]:
     active_interrupts = max(0, interrupt_count)
-    flush_duration_s = min(1.25 + (0.22 * active_interrupts), 2.05)
-    silence_timeout_s = min(6.5 + (1.2 * active_interrupts), 11.5)
+    flush_duration_s = min(1.65 + (0.28 * active_interrupts), 2.45)
+    silence_timeout_s = min(7.0 + (1.1 * active_interrupts), 11.5)
     return flush_duration_s, silence_timeout_s
 
 
@@ -162,12 +162,110 @@ def _format_dispatch_context(dispatch_context: dict[str, Any] | None) -> list[st
     return lines
 
 
+def _format_takeover_context(
+    *,
+    human_takeover_active: bool = False,
+    handoff_recovery_prompt: str | None = None,
+) -> list[str]:
+    if not human_takeover_active and not handoff_recovery_prompt:
+        return []
+    lines = [
+        "",
+        "Human takeover packet:",
+        f"- human_takeover_active: {human_takeover_active}",
+        f"- handoff_recovery_prompt: {handoff_recovery_prompt}",
+        "",
+        "Human takeover rules:",
+    ]
+    if human_takeover_active:
+        lines.extend(
+            [
+                "- a human operator has taken over the live call",
+                "- stop speaking immediately",
+                "- do not ask questions, do not give instructions, and do not produce filler speech while takeover is active",
+                "- remain silent until takeover is cleared",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "- takeover has been cleared",
+                "- when handoff_recovery_prompt is present, your next turn must say that exact question and nothing else before resuming normal flow",
+            ]
+        )
+    return lines
+
+
+def _format_ledger_context(ledger_context: dict[str, Any] | None) -> list[str]:
+    if not ledger_context:
+        return []
+    known = ledger_context.get("known") or {}
+    location_followup_prompt = ledger_context.get("location_followup_prompt")
+    must_say_next = ledger_context.get("must_say_next")
+    lines = [
+        "",
+        "Shared fact ledger packet:",
+        f"- issue_cues: {known.get('issue_cues')}",
+        f"- location_candidate: {known.get('location_candidate')}",
+        f"- sub_location: {known.get('sub_location')}",
+        f"- victim_count_confirmed: {known.get('victim_count_confirmed')}",
+        f"- missing_fields: {ledger_context.get('missing_fields')}",
+        f"- next_question_field: {ledger_context.get('next_question_field')}",
+        f"- next_question_goal: {ledger_context.get('next_question_goal')}",
+        f"- question_style: {ledger_context.get('question_style')}",
+        f"- location_search_allowed: {ledger_context.get('location_search_allowed')}",
+        f"- location_followup_kind: {ledger_context.get('location_followup_kind')}",
+        f"- location_dead_end: {ledger_context.get('location_dead_end')}",
+        f"- location_attempts: {ledger_context.get('location_attempts')}",
+        f"- location_lock_active: {ledger_context.get('location_lock_active')}",
+        f"- candidate_needs_confirmation: {ledger_context.get('candidate_needs_confirmation')}",
+        f"- blocked_actions: {ledger_context.get('blocked_actions')}",
+    ]
+    if location_followup_prompt:
+        lines.append(f"- location_followup_prompt: {location_followup_prompt}")
+    if must_say_next:
+        lines.append(f"- must_say_next: {must_say_next}")
+    lines.extend(
+        [
+            "",
+            "Shared ledger rules:",
+            "- treat the shared fact ledger as the source of truth for confirmed hard facts",
+            "- in SLM + LLM mode, the ledger is the master control plane for question priority",
+            "- the master order is: understand the emergency, confirm the caller is stable enough to continue, resolve location, then gather secondary details",
+            "- if the emergency type is already clear and the caller sounds stable enough to continue, unresolved location outranks people count, injury detail, and other secondary facts",
+            "- do not restate or re-ask any hard fact already present in the ledger",
+            "- use the next_question_goal as your highest-priority conversational target",
+            "- if question_style is yes_no, ask one binary question only",
+            "- if question_style is short_open, ask one short natural question only",
+            "- if location_followup_prompt is present and location_search_allowed is false, use that exact location question next unless the caller is already answering it",
+            "- if candidate_needs_confirmation is true, your next spoken turn must confirm that candidate before any other new question whenever you get a chance to speak",
+            "- if must_say_next is present, your next turn must say that exact confirmation sentence before any other question",
+            "- when location is unresolved, keep returning to the location ladder after any brief safety instruction until location_search_allowed becomes true or location_dead_end becomes true",
+            "- if location_lock_active is true, location is the master priority until it becomes meaningful or reaches a dead end",
+            "- while location_lock_active is true, do not switch to people count, injury detail, or other follow-up questions before finishing the current location step",
+            "- if the caller reports immediate danger while location_lock_active is true, you may give one short safety instruction, then go straight back to the queued location question",
+            "- if the caller asks you to send help before location is usable, say briefly that you need a usable location to get the team to them, then ask the queued location question",
+            "- if the caller asks where help is being sent while location is still unresolved, do not invent a destination; say you need to confirm the location first",
+            "- the location ladder is: ask where they are, ask for the exact address, repeat and confirm the candidate, ask them to spell it, then ask for the nearest landmark and surroundings",
+            "- if candidate_needs_confirmation is true, repeat the candidate clearly and ask for a yes or no confirmation",
+            "- do not geocode or validate location unless location_search_allowed is true",
+            "- use update_soft_ledger only for soft guesses or useful notes; never use it to write confirmed facts",
+            "- never claim a pin, dispatch, or exact address unless tools or dispatch state confirm it",
+            "- if location is unresolved, do not say help is on the way or that a team can reach the caller yet",
+        ]
+    )
+    return lines
+
+
 def _runtime_prompt(
     *,
     interrupt_count: int = 0,
     interruption_recovery: bool = False,
     triage_context: dict[str, Any] | None = None,
+    ledger_context: dict[str, Any] | None = None,
     dispatch_context: dict[str, Any] | None = None,
+    human_takeover_active: bool = False,
+    handoff_recovery_prompt: str | None = None,
 ) -> str:
     prompt = load_dispatch_prompt()
     adaptive_lines: list[str] = []
@@ -194,42 +292,56 @@ def _runtime_prompt(
             ]
         )
     triage_lines = _format_triage_context(triage_context)
+    ledger_lines = _format_ledger_context(ledger_context)
     dispatch_lines = _format_dispatch_context(dispatch_context)
-    return prompt + "\n" + "\n".join(adaptive_lines + triage_lines + dispatch_lines)
+    takeover_lines = _format_takeover_context(
+        human_takeover_active=human_takeover_active,
+        handoff_recovery_prompt=handoff_recovery_prompt,
+    )
+    return prompt + "\n" + "\n".join(adaptive_lines + triage_lines + ledger_lines + dispatch_lines + takeover_lines)
 
 
-def build_tool_defs() -> list[gradbot.ToolDef]:
+def build_tool_defs(*, live_dispatch_mode: str = "slm") -> list[gradbot.ToolDef]:
     return [
         gradbot.ToolDef(
             name=name,
             description=description,
             parameters_json=parameters_json,
         )
-        for name, description, parameters_json in build_gradbot_tool_defs()
+        for name, description, parameters_json in build_gradbot_tool_defs(
+            include_soft_ledger=live_dispatch_mode == "slm"
+        )
     ]
 
 
 def build_session_config(
     *,
+    live_dispatch_mode: str = "slm",
     interrupt_count: int = 0,
     interruption_recovery: bool = False,
     triage_context: dict[str, Any] | None = None,
+    ledger_context: dict[str, Any] | None = None,
     dispatch_context: dict[str, Any] | None = None,
+    human_takeover_active: bool = False,
+    handoff_recovery_prompt: str | None = None,
 ) -> gradbot.SessionConfig:
     voice = gradbot.flagship_voice("Emma")
     prompt = _runtime_prompt(
         interrupt_count=interrupt_count,
         interruption_recovery=interruption_recovery,
         triage_context=triage_context,
+        ledger_context=ledger_context,
         dispatch_context=dispatch_context,
+        human_takeover_active=human_takeover_active,
+        handoff_recovery_prompt=handoff_recovery_prompt,
     )
     flush_duration_s, silence_timeout_s = _adaptive_turn_settings(interrupt_count)
     return gradbot.SessionConfig(
         voice_id=voice.voice_id,
         language=voice.language,
-        assistant_speaks_first=False,
+        assistant_speaks_first=True,
         instructions=prompt,
         silence_timeout_s=silence_timeout_s,
         flush_duration_s=flush_duration_s,
-        tools=build_tool_defs(),
+        tools=build_tool_defs(live_dispatch_mode=live_dispatch_mode),
     )

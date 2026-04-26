@@ -50,16 +50,21 @@
   let recoveryModeArmed = false;
   let assistantTurnActive = false;
   let pendingTriageUpdate = null;
+  let pendingLedgerUpdate = null;
   let pendingDispatchUpdate = null;
   let triageSyncTimeout = null;
   let userFinalizeHandle = null;
   let latestTriageContext = null;
+  let latestLedgerContext = null;
   let latestDispatchContext = null;
   let lastTriageVersionSent = 0;
+  let lastLedgerVersionSent = 0;
   let lastDispatchVersionSent = 0;
   let lastRescueIndexSeen = -1;
   let lastActiveTranscriptProvider = "gradium";
   let humanTakeoverEngaged = false;
+  let stickySummaryText = null;
+  let pendingHandoffResumePrompt = null;
   let currentAudioConfig = {
     pcm: false,
     pcm_input: false,
@@ -73,6 +78,7 @@
   const SHORT_FINALIZE_DELAY_MS = 180;
   const DEFAULT_FINALIZE_DELAY_MS = 450;
   const DISPATCH_MODE_STORAGE_KEY = "dispatchMode";
+  const HANDOFF_RESUME_PROMPT = "What is your status now?";
 
   function normalizeDispatchMode(value) {
     return String(value || "slm").trim().toLowerCase() === "llm_only" ? "llm_only" : "slm";
@@ -271,6 +277,9 @@
 
   function logTranscript(text, isUser) {
     if (!text || !String(text).trim()) return;
+    if (!isUser && !humanTakeoverEngaged && pendingHandoffResumePrompt) {
+      pendingHandoffResumePrompt = null;
+    }
     const item = {
       at: new Date().toISOString(),
       text,
@@ -296,6 +305,11 @@
     return { ...latestDispatchContext };
   }
 
+  function currentLedgerContextForWire() {
+    if (!latestLedgerContext) return null;
+    return { ...latestLedgerContext };
+  }
+
   function raiseAdaptivePatience(reason) {
     const nowMs = Date.now();
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -310,7 +324,10 @@
         interrupt_count: interruptCount,
         interruption_recovery: true,
         triage_context: latestTriageContext,
+        ledger_context: currentLedgerContextForWire(),
         dispatch_context: currentDispatchContextForWire(),
+        human_takeover_active: humanTakeoverEngaged,
+        handoff_recovery_prompt: pendingHandoffResumePrompt,
       })
     );
     logEvent(`adaptive patience raised after interruption (${interruptCount})`);
@@ -327,13 +344,17 @@
         interrupt_count: interruptCount,
         interruption_recovery: false,
         triage_context: latestTriageContext,
+        ledger_context: currentLedgerContextForWire(),
         dispatch_context: currentDispatchContextForWire(),
+        human_takeover_active: humanTakeoverEngaged,
+        handoff_recovery_prompt: pendingHandoffResumePrompt,
       })
     );
   }
 
   function sendTriageConfig(reason = "triage_update") {
-    if (!ws || ws.readyState !== WebSocket.OPEN || (!latestTriageContext && !latestDispatchContext)) return;
+    const hasControlUpdate = humanTakeoverEngaged || Boolean(pendingHandoffResumePrompt);
+    if (!ws || ws.readyState !== WebSocket.OPEN || (!latestTriageContext && !latestLedgerContext && !latestDispatchContext && !hasControlUpdate)) return;
     const dispatchContext = currentDispatchContextForWire();
     ws.send(
       JSON.stringify({
@@ -342,7 +363,10 @@
         interrupt_count: interruptCount,
         interruption_recovery: recoveryModeArmed,
         triage_context: latestTriageContext,
+        ledger_context: currentLedgerContextForWire(),
         dispatch_context: dispatchContext,
+        human_takeover_active: humanTakeoverEngaged,
+        handoff_recovery_prompt: pendingHandoffResumePrompt,
       })
     );
     if (latestDispatchContext?.announcement_line) {
@@ -599,6 +623,11 @@
           pendingTriageUpdate = null;
           pushTriageContext(queuedUpdate);
         }
+        if (pendingLedgerUpdate) {
+          const queuedUpdate = pendingLedgerUpdate;
+          pendingLedgerUpdate = null;
+          pushLedgerContext(queuedUpdate);
+        }
         if (pendingDispatchUpdate) {
           const queuedDispatch = pendingDispatchUpdate;
           pendingDispatchUpdate = null;
@@ -649,6 +678,21 @@
     logEvent(`triage context updated (${version})`);
   }
 
+  function pushLedgerContext(update) {
+    if (!update || !update.prompt_context) return;
+    latestLedgerContext = update.prompt_context;
+    const version = Number(update.version || update.prompt_context.version || 0);
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!version || version <= lastLedgerVersionSent) return;
+    if (assistantTurnActive) {
+      pendingLedgerUpdate = update;
+      return;
+    }
+    lastLedgerVersionSent = version;
+    sendTriageConfig("ledger_update");
+    logEvent(`shared ledger updated (${version})`);
+  }
+
   function pushDispatchContext(update) {
     if (!update || !update.prompt_context) return;
     latestDispatchContext = update.prompt_context;
@@ -678,6 +722,9 @@
       .catch(() => null);
     if (result?.triage_update?.prompt_context) {
       pushTriageContext(result.triage_update);
+    }
+    if (result?.ledger_update?.prompt_context) {
+      pushLedgerContext(result.ledger_update);
     }
     if (result?.dispatch_update?.prompt_context) {
       pushDispatchContext(result.dispatch_update);
@@ -830,6 +877,41 @@
     };
   }
 
+  function isLowSignalSummary(text) {
+    const normalized = String(text || "").trim();
+    if (!normalized) return true;
+    const compact = normalized.toLowerCase();
+    const confirmations = (compact.match(/\b(?:yes|no|maybe|okay|ok|correct|sorry)\b/g) || []).length;
+    const uncertainty = (compact.match(/\b(?:i don't know|dont know|not sure)\b/g) || []).length;
+    const sentenceCount = normalized
+      .split(/[.!?]+/)
+      .map((part) => part.trim())
+      .filter(Boolean).length;
+    if (/(?:\byes\b[,. ]*){2,}|(?:\bno\b[,. ]*){2,}/i.test(compact)) return true;
+    if (confirmations + uncertainty >= 4 && normalized.length >= 60) return true;
+    if (sentenceCount >= 5 && confirmations >= 2) return true;
+    return false;
+  }
+
+  function selectStickySummary(handoffBrief, ticket, latestCaller) {
+    const candidates = [
+      handoffBrief.one_line,
+      handoffBrief.caller_summary,
+      ticket.caller_summary,
+      latestCaller,
+    ]
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+
+    for (const candidate of candidates) {
+      if (!isLowSignalSummary(candidate)) {
+        stickySummaryText = candidate;
+        return candidate;
+      }
+    }
+    return stickySummaryText || "Processing...";
+  }
+
   function buildOperatorBrief(session, state, severity) {
     const triageMeta = session.triage_meta || {};
     const merged = session.merged_triage_state || {};
@@ -837,12 +919,7 @@
     const latestCaller = latestTranscriptText(session?.client?.transcripts?.user, 4);
     const ticket = state.ticketCall?.result || {};
     const handoffBrief = state.handoffBriefCall?.result || {};
-    const summary =
-      handoffBrief.caller_summary ||
-      handoffBrief.one_line ||
-      ticket.caller_summary ||
-      latestCaller ||
-      "The system is still gathering stable caller details.";
+    const summary = selectStickySummary(handoffBrief, ticket, latestCaller);
     const confirmed = [];
     if (state.location && state.location !== "Pending") {
       confirmed.push(`Location: ${state.location}`);
@@ -880,6 +957,9 @@
           ? handoffBrief.unknowns
           : [];
     let nextMove = "Human can take over with the current packet and continue live questioning.";
+    if (humanTakeoverEngaged) {
+      nextMove = "Human operator is on the line. Press hand back when you want the agent to resume with a status check.";
+    } else
     if (!state.hasPin) {
       nextMove = "Get one landmark or road sign. If the place name sounds unstable, ask the caller to spell it.";
     } else if (state.humanMonitoring && state.monitorName) {
@@ -922,7 +1002,7 @@
     severityScoreEl.textContent = `${severity.score} / 100`;
     severitySubtextEl.textContent = severity.subtext;
     const buttonLabel = humanTakeoverEngaged
-      ? "Human Taking Over"
+      ? "Hand Back To Agent"
       : severity.score >= 86
         ? "Take Over Now"
         : severity.score >= 61
@@ -1263,6 +1343,95 @@
       `;
       return;
     }
+    const sharedLedger = session.shared_ledger || null;
+    if (serverMode === "slm" && sharedLedger) {
+      const hardFacts = sharedLedger.hard_facts || {};
+      const softState = sharedLedger.soft_state || {};
+      const priority = sharedLedger.priority || {};
+      const locationGate = sharedLedger.location_gate || {};
+      const provenance = sharedLedger.provenance || {};
+      const confirmedFacts = [];
+      if ((hardFacts.issue_cues || []).length) {
+        confirmedFacts.push(`Issue cues: ${(hardFacts.issue_cues || []).map(titleCase).join(", ")}`);
+      }
+      if (hardFacts.location_candidate || locationGate.candidate_text) {
+        confirmedFacts.push(`Location candidate: ${hardFacts.location_candidate || locationGate.candidate_text}`);
+      }
+      if (hardFacts.sub_location) {
+        confirmedFacts.push(`Sub-location: ${hardFacts.sub_location}`);
+      }
+      if (hardFacts.victim_count_confirmed !== "unknown") {
+        confirmedFacts.push(`Confirmed people count: ${hardFacts.victim_count_confirmed}`);
+      }
+      ["child_present", "bleeding_status", "breathing_status", "consciousness_status", "trapped_status"].forEach((field) => {
+        if (hardFacts[field] && hardFacts[field] !== "unknown") {
+          confirmedFacts.push(`${humanizeField(field)}: ${hardFacts[field]}`);
+        }
+      });
+      const softGuesses = [];
+      if (softState.people_count_best_guess != null) {
+        softGuesses.push(`People count estimate: ${softState.people_count_best_guess}`);
+      }
+      if (softState.caller_role && softState.caller_role !== "unknown") {
+        softGuesses.push(`Caller role: ${softState.caller_role}`);
+      }
+      (softState.notes || []).forEach((note) => softGuesses.push(note));
+      triagePanelEl.innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><span>Mode</span><strong>${escapeHtml(dispatchModeLabel(serverMode))}</strong></div>
+          <div class="kv-row"><span>SLM Status</span><strong>${escapeHtml(provenance.slm_job_state || "idle")}</strong></div>
+          <div class="kv-row"><span>Ledger Version</span><strong>${escapeHtml(String(sharedLedger.version || 0))}</strong></div>
+          <div class="kv-row"><span>Last SLM Run</span><strong>${escapeHtml(provenance.last_slm_run_at || "pending")}</strong></div>
+          <div class="kv-row"><span>Next Question</span><strong>${escapeHtml(priority.next_question_goal || "hold steady")}</strong></div>
+          <div class="kv-row"><span>Question Style</span><strong>${escapeHtml(priority.question_style || "short_open")}</strong></div>
+          <div class="kv-row"><span>Location Gate</span><strong>${escapeHtml(locationGate.search_allowed ? "search allowed" : "search guarded")}</strong></div>
+          <div class="kv-row"><span>Location Next Step</span><strong>${escapeHtml(priority.location_followup_kind || "none")}</strong></div>
+        </div>
+        <div class="ticket-summary">
+          <div class="section-label">Confirmed Hard Facts</div>
+          ${
+            confirmedFacts.length
+              ? `<ul>${confirmedFacts.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+              : `<p>No confirmed hard facts yet.</p>`
+          }
+        </div>
+        <div class="ticket-summary">
+          <div class="section-label">Soft Estimates</div>
+          ${
+            softGuesses.length
+              ? `<ul>${softGuesses.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+              : `<p>No soft estimates yet.</p>`
+          }
+        </div>
+        <div class="ticket-summary">
+          <div class="section-label">Still Missing</div>
+          ${
+            (priority.missing_fields || []).length
+              ? `<p>${escapeHtml((priority.missing_fields || []).map(humanizeField).join(", "))}</p>`
+              : `<p>No major hard-fact gaps right now.</p>`
+          }
+        </div>
+        <div class="ticket-summary">
+          <div class="section-label">Location State</div>
+          <p>${escapeHtml(
+            [
+              locationGate.search_reason || "pending",
+              locationGate.candidate_text || null,
+              locationGate.candidate_only ? "candidate only" : null,
+              locationGate.needs_confirmation ? "needs confirmation" : null,
+              locationGate.confirmed ? "confirmed" : null,
+            ]
+              .filter(Boolean)
+              .join(" · ")
+          )}</p>
+        </div>
+        <div class="ticket-summary">
+          <div class="section-label">Location Follow-Up</div>
+          <p>${escapeHtml(priority.location_followup_prompt || "No location follow-up queued.")}</p>
+        </div>
+      `;
+      return;
+    }
     if (!latestTurn && !Object.keys(merged).length) {
       triagePanelEl.innerHTML = `
         <article class="entry event">
@@ -1452,8 +1621,12 @@
   }
 
   function deriveDashboardState(session) {
+    const serverMode = normalizeDispatchMode(session.server?.live_dispatch_mode || session.server?.triage_engine);
     const toolCalls = session.tool_calls || [];
     const dispatchServicesState = session.dispatch_services || {};
+    const sharedLedger = session.shared_ledger || {};
+    const hardFacts = sharedLedger.hard_facts || {};
+    const locationGate = sharedLedger.location_gate || {};
     const resolveNoteCall = latestToolCall(toolCalls, "resolve_location_note");
     const nearbyContextCall = latestToolCall(toolCalls, "nearby_context");
     const checklistCall = latestToolCall(toolCalls, "checklist_by_incident");
@@ -1477,6 +1650,7 @@
     const issueType =
       ticketResult.issue_type ||
       ticketArgs.issue_type ||
+      ((hardFacts.issue_cues || []).length ? (hardFacts.issue_cues || []).map(titleCase).join(", ") : null) ||
       transcriptIssue ||
       "Pending";
     const location =
@@ -1484,6 +1658,9 @@
       nearbyContextCall?.result?.normalized_address ||
       validatedLocation?.normalized_address ||
       lookedUpLocation?.normalized_address ||
+      hardFacts.location_candidate ||
+      locationGate.candidate_text ||
+      hardFacts.location_note ||
       resolveNoteCall?.result?.anchor_location ||
       transcriptLocation.text ||
       resolveNoteCall?.result?.normalized_note ||
@@ -1513,12 +1690,14 @@
       nearbyContextCall?.result?.reason ||
       validatedLocation?.source ||
       lookedUpLocation?.source ||
+      (serverMode === "slm" ? locationGate.search_reason : null) ||
       candidateLocationResult?.source ||
       transcriptLocation.source ||
       null;
     const mapConfidence =
       validatedLocation?.confidence ||
       lookedUpLocation?.confidence ||
+      (serverMode === "slm" ? (locationGate.confirmed ? "confirmed" : locationGate.candidate_only ? "needs confirmation" : null) : null) ||
       (candidateLocationResult ? "needs confirmation" : null) ||
       transcriptLocation.confidence ||
       null;
@@ -1553,6 +1732,8 @@
       monitorName: dispatchServicesState.monitor_name || null,
       seriousEmergency: Boolean(dispatchServicesState.serious_emergency),
       dispatchAnnouncement: dispatchServicesState.announcement_line || null,
+      serverMode,
+      sharedLedger,
       resolveNoteCall,
       nearbyContextCall,
       checklistCall,
@@ -1830,14 +2011,19 @@
     recoveryModeArmed = false;
     assistantTurnActive = false;
     pendingTriageUpdate = null;
+    pendingLedgerUpdate = null;
     pendingDispatchUpdate = null;
     latestTriageContext = null;
+    latestLedgerContext = null;
     latestDispatchContext = null;
     lastTriageVersionSent = 0;
+    lastLedgerVersionSent = 0;
     lastDispatchVersionSent = 0;
     lastRescueIndexSeen = -1;
     lastActiveTranscriptProvider = "gradium";
     humanTakeoverEngaged = false;
+    stickySummaryText = null;
+    pendingHandoffResumePrompt = null;
     eventLogEl.innerHTML = "";
     resetDashboard();
     renderDialogueStreams();
@@ -1875,6 +2061,9 @@
       };
 
       ws.onmessage = (event) => {
+        if (humanTakeoverEngaged && event.data instanceof Blob) {
+          return;
+        }
         player.handleMessage(event.data);
       };
 
@@ -1966,6 +2155,11 @@
     reportSent = false;
     lastActiveTranscriptProvider = "gradium";
     humanTakeoverEngaged = false;
+    stickySummaryText = null;
+    pendingHandoffResumePrompt = null;
+    latestLedgerContext = null;
+    lastLedgerVersionSent = 0;
+    pendingLedgerUpdate = null;
     resetDashboard();
     renderDialogueStreams();
   });
@@ -1976,7 +2170,13 @@
       return;
     }
     humanTakeoverEngaged = !humanTakeoverEngaged;
-    logEvent(humanTakeoverEngaged ? "human takeover engaged (dummy)" : "human takeover cleared (dummy)");
+    pendingHandoffResumePrompt = humanTakeoverEngaged ? null : HANDOFF_RESUME_PROMPT;
+    sendTriageConfig(humanTakeoverEngaged ? "human_takeover_engaged" : "human_takeover_cleared");
+    logEvent(
+      humanTakeoverEngaged
+        ? "human takeover engaged"
+        : `handover returned to agent · next question: ${HANDOFF_RESUME_PROMPT}`
+    );
     renderOperatorDesk(latestSession, deriveDashboardState(latestSession));
   });
 

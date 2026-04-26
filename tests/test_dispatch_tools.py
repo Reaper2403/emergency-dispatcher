@@ -15,6 +15,7 @@ from emergency_dispatcher.dispatch_tools import plan_response_services
 from emergency_dispatcher.dispatch_tools import resolve_location_note
 from emergency_dispatcher.dispatch_tools import run_dispatch_workflow
 from emergency_dispatcher.dispatch_tools import simulate_dispatch_services
+from emergency_dispatcher.dispatch_tools import update_soft_ledger
 from emergency_dispatcher.dispatch_tools import validate_address
 
 
@@ -207,6 +208,382 @@ def test_lookup_address_google_result_is_json_serializable(monkeypatch):
     assert result["candidates"][0] is not result
 
 
+def test_lookup_address_allow_best_effort_can_resolve_place_like_candidate(monkeypatch):
+    monkeypatch.setattr(
+        dispatch_tools,
+        "_load_berlin_location_semantic_index",
+        lambda: {
+            "entries": (
+                {
+                    "kind": "place",
+                    "candidate": "Tempelhofer Feld",
+                    "normalized": "tempelhofer feld",
+                    "compact": "tempelhoferfeld",
+                    "stem": "tempelhofer",
+                    "suffix": "feld",
+                },
+            ),
+            "by_suffix_prefix": {
+                ("feld", "te"): [
+                    {
+                        "kind": "place",
+                        "candidate": "Tempelhofer Feld",
+                        "normalized": "tempelhofer feld",
+                        "compact": "tempelhoferfeld",
+                        "stem": "tempelhofer",
+                        "suffix": "feld",
+                    }
+                ],
+                ("feld", "t"): [
+                    {
+                        "kind": "place",
+                        "candidate": "Tempelhofer Feld",
+                        "normalized": "tempelhofer feld",
+                        "compact": "tempelhoferfeld",
+                        "stem": "tempelhofer",
+                        "suffix": "feld",
+                    }
+                ],
+            },
+            "by_suffix": {
+                "feld": [
+                    {
+                        "kind": "place",
+                        "candidate": "Tempelhofer Feld",
+                        "normalized": "tempelhofer feld",
+                        "compact": "tempelhoferfeld",
+                        "stem": "tempelhofer",
+                        "suffix": "feld",
+                    }
+                ]
+            },
+            "by_prefix": {
+                "te": [
+                    {
+                        "kind": "place",
+                        "candidate": "Tempelhofer Feld",
+                        "normalized": "tempelhofer feld",
+                        "compact": "tempelhoferfeld",
+                        "stem": "tempelhofer",
+                        "suffix": "feld",
+                    }
+                ],
+                "t": [
+                    {
+                        "kind": "place",
+                        "candidate": "Tempelhofer Feld",
+                        "normalized": "tempelhofer feld",
+                        "compact": "tempelhoferfeld",
+                        "stem": "tempelhofer",
+                        "suffix": "feld",
+                    }
+                ],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        dispatch_tools,
+        "_google_geocode_candidates",
+        lambda _query: [
+            {
+                "formatted_address": "Tempelhofer Feld, Tempelhofer Damm, 12101 Berlin, Germany",
+                "place_id": "tempelhofer-feld",
+                "types": ["park", "point_of_interest"],
+                "geometry": {
+                    "location": {
+                        "lat": 52.4748569,
+                        "lng": 13.4005926,
+                    },
+                    "location_type": "GEOMETRIC_CENTER",
+                },
+                "address_components": [
+                    {"long_name": "Tempelhofer Feld", "types": ["establishment"]},
+                    {"long_name": "Berlin", "types": ["locality"]},
+                    {"long_name": "Berlin", "types": ["administrative_area_level_1"]},
+                    {"long_name": "Germany", "types": ["country"]},
+                ],
+            }
+        ],
+    )
+    monkeypatch.setattr(dispatch_tools, "_nominatim_candidates", lambda _query: [])
+
+    result = lookup_address("Templehofer Feld", allow_best_effort=True)
+
+    assert result["found"] is True
+    assert result["source"] == "google_geocoding"
+    assert result["normalized_address"] == "Tempelhofer Feld, Tempelhofer Damm, 12101 Berlin, Germany"
+    assert result["semantic_match"]["candidate"] == "Tempelhofer Feld"
+    assert result["semantic_match"]["apply"] is True
+
+
+def test_semantic_match_berlin_location_rejects_ambiguous_guess(monkeypatch):
+    monkeypatch.setattr(
+        dispatch_tools,
+        "_load_berlin_location_semantic_index",
+        lambda: {
+            "entries": (
+                {
+                    "kind": "street",
+                    "candidate": "Merziger Straße",
+                    "normalized": "merziger strasse",
+                    "compact": "merzigerstrasse",
+                    "stem": "merziger",
+                    "suffix": "strasse",
+                },
+                {
+                    "kind": "street",
+                    "candidate": "Maarer Straße",
+                    "normalized": "maarer strasse",
+                    "compact": "maarerstrasse",
+                    "stem": "maarer",
+                    "suffix": "strasse",
+                },
+            ),
+            "by_suffix_prefix": {
+                ("strasse", "ma"): [
+                    {
+                        "kind": "street",
+                        "candidate": "Merziger Straße",
+                        "normalized": "merziger strasse",
+                        "compact": "merzigerstrasse",
+                        "stem": "merziger",
+                        "suffix": "strasse",
+                    },
+                    {
+                        "kind": "street",
+                        "candidate": "Maarer Straße",
+                        "normalized": "maarer strasse",
+                        "compact": "maarerstrasse",
+                        "stem": "maarer",
+                        "suffix": "strasse",
+                    },
+                ],
+                ("strasse", "m"): [
+                    {
+                        "kind": "street",
+                        "candidate": "Merziger Straße",
+                        "normalized": "merziger strasse",
+                        "compact": "merzigerstrasse",
+                        "stem": "merziger",
+                        "suffix": "strasse",
+                    },
+                    {
+                        "kind": "street",
+                        "candidate": "Maarer Straße",
+                        "normalized": "maarer strasse",
+                        "compact": "maarerstrasse",
+                        "stem": "maarer",
+                        "suffix": "strasse",
+                    },
+                ],
+            },
+            "by_suffix": {
+                "strasse": [
+                    {
+                        "kind": "street",
+                        "candidate": "Merziger Straße",
+                        "normalized": "merziger strasse",
+                        "compact": "merzigerstrasse",
+                        "stem": "merziger",
+                        "suffix": "strasse",
+                    },
+                    {
+                        "kind": "street",
+                        "candidate": "Maarer Straße",
+                        "normalized": "maarer strasse",
+                        "compact": "maarerstrasse",
+                        "stem": "maarer",
+                        "suffix": "strasse",
+                    },
+                ]
+            },
+            "by_prefix": {
+                "ma": [
+                    {
+                        "kind": "street",
+                        "candidate": "Merziger Straße",
+                        "normalized": "merziger strasse",
+                        "compact": "merzigerstrasse",
+                        "stem": "merziger",
+                        "suffix": "strasse",
+                    },
+                    {
+                        "kind": "street",
+                        "candidate": "Maarer Straße",
+                        "normalized": "maarer strasse",
+                        "compact": "maarerstrasse",
+                        "stem": "maarer",
+                        "suffix": "strasse",
+                    },
+                ],
+                "m": [
+                    {
+                        "kind": "street",
+                        "candidate": "Merziger Straße",
+                        "normalized": "merziger strasse",
+                        "compact": "merzigerstrasse",
+                        "stem": "merziger",
+                        "suffix": "strasse",
+                    },
+                    {
+                        "kind": "street",
+                        "candidate": "Maarer Straße",
+                        "normalized": "maarer strasse",
+                        "compact": "maarerstrasse",
+                        "stem": "maarer",
+                        "suffix": "strasse",
+                    },
+                ],
+            },
+        },
+    )
+
+    result = dispatch_tools._semantic_match_berlin_location("Madriger Strasse")
+
+    assert result is not None
+    assert result["apply"] is False
+
+
+def test_lookup_address_allow_best_effort_uses_semantic_candidate_before_geocoding(monkeypatch):
+    monkeypatch.setattr(
+        dispatch_tools,
+        "_load_berlin_location_semantic_index",
+        lambda: {
+            "entries": (
+                {
+                    "kind": "street",
+                    "candidate": "Oxforder Straße",
+                    "normalized": "oxforder strasse",
+                    "compact": "oxforderstrasse",
+                    "stem": "oxforder",
+                    "suffix": "strasse",
+                },
+            ),
+            "by_suffix_prefix": {
+                ("strasse", "ox"): [
+                    {
+                        "kind": "street",
+                        "candidate": "Oxforder Straße",
+                        "normalized": "oxforder strasse",
+                        "compact": "oxforderstrasse",
+                        "stem": "oxforder",
+                        "suffix": "strasse",
+                    }
+                ],
+                ("strasse", "o"): [
+                    {
+                        "kind": "street",
+                        "candidate": "Oxforder Straße",
+                        "normalized": "oxforder strasse",
+                        "compact": "oxforderstrasse",
+                        "stem": "oxforder",
+                        "suffix": "strasse",
+                    }
+                ],
+            },
+            "by_suffix": {
+                "strasse": [
+                    {
+                        "kind": "street",
+                        "candidate": "Oxforder Straße",
+                        "normalized": "oxforder strasse",
+                        "compact": "oxforderstrasse",
+                        "stem": "oxforder",
+                        "suffix": "strasse",
+                    }
+                ]
+            },
+            "by_prefix": {
+                "ox": [
+                    {
+                        "kind": "street",
+                        "candidate": "Oxforder Straße",
+                        "normalized": "oxforder strasse",
+                        "compact": "oxforderstrasse",
+                        "stem": "oxforder",
+                        "suffix": "strasse",
+                    }
+                ],
+                "o": [
+                    {
+                        "kind": "street",
+                        "candidate": "Oxforder Straße",
+                        "normalized": "oxforder strasse",
+                        "compact": "oxforderstrasse",
+                        "stem": "oxforder",
+                        "suffix": "strasse",
+                    }
+                ],
+            },
+        },
+    )
+
+    def fake_google(query):
+        if query == "Oxforder Straße":
+            return [
+                {
+                    "formatted_address": "Oxforder Str., 13349 Berlin, Germany",
+                    "place_id": "oxforder",
+                    "types": ["route"],
+                    "geometry": {
+                        "location": {"lat": 52.5594, "lng": 13.3491},
+                        "location_type": "GEOMETRIC_CENTER",
+                    },
+                    "address_components": [
+                        {"long_name": "Oxforder Straße", "types": ["route"]},
+                        {"long_name": "Berlin", "types": ["locality"]},
+                        {"long_name": "Berlin", "types": ["administrative_area_level_1"]},
+                        {"long_name": "Germany", "types": ["country"]},
+                    ],
+                }
+            ]
+        if query == "Oxford Strasse":
+            return [
+                {
+                    "formatted_address": "Fasanenstraße 6, 10623 Berlin, Germany",
+                    "place_id": "bad-jump",
+                    "types": ["street_address"],
+                    "geometry": {
+                        "location": {"lat": 52.5069424, "lng": 13.3277458},
+                        "location_type": "ROOFTOP",
+                    },
+                    "address_components": [
+                        {"long_name": "Fasanenstraße 6", "types": ["route"]},
+                        {"long_name": "Berlin", "types": ["locality"]},
+                        {"long_name": "Berlin", "types": ["administrative_area_level_1"]},
+                        {"long_name": "Germany", "types": ["country"]},
+                    ],
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(dispatch_tools, "_google_geocode_candidates", fake_google)
+    monkeypatch.setattr(dispatch_tools, "_nominatim_candidates", lambda _query: [])
+
+    result = lookup_address("Oxford Strasse", allow_best_effort=True)
+
+    assert result["normalized_address"] == "Oxforder Str., 13349 Berlin, Germany"
+    assert result["semantic_match"]["candidate"] == "Oxforder Straße"
+    assert result["semantic_match"]["apply"] is True
+
+
+def test_semantic_match_ignores_trailing_berlin_and_recovers_street():
+    result = dispatch_tools._semantic_match_berlin_location("Oxford Strassen, Berlin")
+
+    assert result is not None
+    assert result["candidate"] == "Oxforder Straße"
+    assert result["apply"] is True
+
+
+def test_resolve_location_note_strips_now_at_prefix():
+    result = resolve_location_note(
+        "I am right now at Dublin Ostrasse.",
+        location_candidate="Dublin Ostrasse",
+    )
+
+    assert result["anchor_location"] == "Dublin Ostrasse"
+
+
 def test_validate_address_rejects_generic_google_city_match(monkeypatch):
     monkeypatch.setattr(
         dispatch_tools,
@@ -349,6 +726,22 @@ def test_resolve_location_note_preserves_landmark_without_fake_pin():
     assert result["sub_location"] == "west entrance"
 
 
+def test_resolve_location_note_extracts_named_place_with_sub_location():
+    result = resolve_location_note("somewhere close to Delta Campus, fourth floor", sub_location="fourth floor")
+
+    assert result["anchor_location"] == "Delta Campus"
+    assert result["location_status"] == "usable_place"
+    assert result["sub_location"] == "fourth floor"
+
+
+def test_resolve_location_note_strips_command_prefix_from_named_place():
+    result = resolve_location_note("find delta campus.")
+
+    assert result["anchor_location"] == "delta campus"
+    assert result["search_allowed"] is True
+    assert result["location_status"] == "usable_place"
+
+
 def test_resolve_location_note_promotes_new_street_anchor_from_note():
     result = resolve_location_note(
         "Near Müllerstraße, outside the subway station, toward the sea exit.",
@@ -359,6 +752,14 @@ def test_resolve_location_note_promotes_new_street_anchor_from_note():
     assert result["anchor_location"] == "Müllerstraße"
     assert result["search_allowed"] is True
     assert result["location_status"] == "usable_place"
+
+
+def test_resolve_location_note_does_not_promote_bare_street_suffix():
+    result = resolve_location_note("strasse")
+
+    assert result["anchor_location"] is None
+    assert result["search_allowed"] is False
+    assert result["location_status"] == "best_effort_note"
 
 
 def test_nearby_context_returns_summary_for_geocoded_address():
@@ -415,6 +816,27 @@ def test_live_gradbot_tool_set_keeps_fact_tools_and_retires_weak_ones():
         "build_handoff_brief",
         "create_incident_ticket",
     ]
+
+
+def test_live_gradbot_tool_set_can_opt_into_soft_ledger_updates():
+    tool_names = [name for name, _description, _schema in build_gradbot_tool_defs(include_soft_ledger=True)]
+
+    assert tool_names[-1] == "update_soft_ledger"
+
+
+def test_update_soft_ledger_only_returns_soft_fields():
+    result = update_soft_ledger(
+        {
+            "people_count_best_guess": 2,
+            "caller_role": "witness",
+            "notes": ["caller sounds unsure", "child may be nearby"],
+        }
+    )
+
+    assert result["soft_state"]["people_count_best_guess"] == 2
+    assert result["soft_state"]["caller_role"] == "witness"
+    assert result["soft_state"]["notes"] == ["caller sounds unsure", "child may be nearby"]
+    assert "people_count_best_guess" in result["updated_fields"]
 
 
 def test_plan_response_services_flags_hostage_call_for_police_and_ambulance():
