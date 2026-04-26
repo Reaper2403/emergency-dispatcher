@@ -6,6 +6,13 @@ __pycache__/
 .venv/
 venv/
 models/
+.cache/
+.pytest_cache/
+*.aicmodel
+runs/
+data/generated/
+data/lexicon/
+*.egg-info/
 *.wav
 *.mp3
 *.ogg

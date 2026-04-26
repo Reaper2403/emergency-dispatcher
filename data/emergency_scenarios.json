@@ -1,0 +1,29 @@
+[
+  {
+    "id": "road-fire-berlin",
+    "title": "Vehicle smoke on the roadside",
+    "noise_profile": "traffic, wind, passing trucks",
+    "transcript": "Hi please hurry, I'm on Müllerstraße near number 128, Berlin and there is smoke coming out of a delivery van after a crash. The driver looks trapped and people are yelling around me.",
+    "expected_issue_type": "fire",
+    "expected_priority": "critical",
+    "expected_address": "128 Müllerstraße, Berlin"
+  },
+  {
+    "id": "factory-collapse",
+    "title": "Worker collapse on industrial floor",
+    "noise_profile": "machinery, alarms, shouted speech",
+    "transcript": "Hello we need an ambulance at 42 Edison Park, Berlin. A worker just collapsed near the loading bay and he is not breathing right now. It's very loud in here.",
+    "expected_issue_type": "medical",
+    "expected_priority": "critical",
+    "expected_address": "42 Edison Park, Berlin"
+  },
+  {
+    "id": "gas-leak-flat",
+    "title": "Possible gas leak in an apartment building",
+    "noise_profile": "hallway echo, panicked speech, babies crying",
+    "transcript": "I think there's a gas leak at 77 Sonnenallee, Berlin. People are coughing and I can smell fumes in the stairwell. Please send someone fast.",
+    "expected_issue_type": "hazmat",
+    "expected_priority": "high",
+    "expected_address": "77 Sonnenallee, Berlin"
+  }
+]

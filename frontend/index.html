@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Emergency Dispatcher Demo</title>
+    <link rel="stylesheet" href="/demo-static/styles.css" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Emergency Dispatcher</p>
+        <h1>Live Dispatch Console</h1>
+        <p class="subtitle">
+          One-screen demo view for the live call, the current dispatch state, and every tool
+          call the system makes while the conversation is still happening.
+        </p>
+      </section>
+
+      <section class="top-deck">
+        <section class="controls card controls-rail">
+          <div class="controls-head">
+            <p class="card-kicker">Dispatch Console</p>
+            <h2>Live Controls</h2>
+            <p>Keep mode switching and latency checks close, without taking over the whole page.</p>
+          </div>
+
+          <div class="status-row">
+            <div>
+              <p class="label">Connection</p>
+              <p id="status" class="status idle">Idle</p>
+            </div>
+            <div>
+              <p class="label">Playback Buffer</p>
+              <p id="buffer-metric" class="metric">0 ms</p>
+            </div>
+            <div>
+              <p class="label">Active Session</p>
+              <p id="session-metric" class="metric subtle">Not started</p>
+            </div>
+            <div>
+              <p class="label">Dispatch State</p>
+              <p id="dispatch-metric" class="metric subtle">Waiting</p>
+            </div>
+          </div>
+
+          <div class="button-row">
+            <button id="connect-btn" class="button primary">Start Call</button>
+            <button id="disconnect-btn" class="button ghost" disabled>Stop</button>
+            <button id="clear-btn" class="button ghost">Clear Log</button>
+          </div>
+
+          <div class="mode-row">
+            <label class="mode-control" for="dispatch-mode-select">
+              <span class="label">Dispatch Mode</span>
+              <select id="dispatch-mode-select" class="mode-select">
+                <option value="slm">SLM + LLM</option>
+                <option value="llm_only">LLM only</option>
+              </select>
+            </label>
+            <p class="mode-hint">
+              Use <strong>LLM only</strong> to compare the raw voice path against the full
+              <strong>SLM + LLM</strong> path.
+            </p>
+          </div>
+        </section>
+
+        <div class="command-board">
+          <article class="card operator-card">
+            <div class="card-head">
+              <h2>Human Desk</h2>
+              <p>Severity signal, operator brief, and a dummy takeover control</p>
+            </div>
+            <div class="operator-shell">
+              <div id="severity-hero" class="severity-hero severity-green">
+                <div>
+                  <p class="severity-label">Autonomous Handling</p>
+                  <strong id="severity-score">0 / 100</strong>
+                  <p id="severity-subtext" class="severity-subtext">Waiting for a live incident.</p>
+                </div>
+                <button id="takeover-btn" class="button takeover-button severity-green" type="button">
+                  Human Standby
+                </button>
+              </div>
+              <div id="operator-report" class="operator-report">
+                <article class="entry event">
+                  <div class="body">Start a call to populate the human handoff brief.</div>
+                </article>
+              </div>
+            </div>
+          </article>
+
+          <article class="card situation-card">
+            <div class="card-head situation-head">
+              <div>
+                <p class="card-kicker">Live Situation Board</p>
+                <h2>Map And Hard Facts</h2>
+                <p>Put the pin, the current location confidence, and the latest grounded facts in one place.</p>
+              </div>
+            </div>
+            <div class="map-shell map-shell-prominent">
+              <div id="map" class="map-panel map-panel-hero"></div>
+              <div id="map-status" class="map-status">Waiting for a geocoded location.</div>
+            </div>
+            <div class="situation-summary">
+              <div id="snapshot-grid" class="snapshot-grid"></div>
+              <div class="dashboard-section">
+                <div class="section-label">Services</div>
+                <div id="service-panel" class="service-panel">
+                  <article class="service-card service-card-pending">
+                    <div class="service-top">
+                      <strong>Services</strong>
+                      <span class="service-state">Pending</span>
+                    </div>
+                    <p>Start a call to populate the service board.</p>
+                    <small>Police, ambulance, and fire updates will appear here.</small>
+                  </article>
+                </div>
+              </div>
+              <div class="dashboard-section">
+                <div class="section-label">Assigned Labels</div>
+                <div id="label-chips" class="chip-row"></div>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="dispatch-layout">
+        <article class="card primary-pane">
+          <div class="card-head">
+            <h2>Live Dialogue</h2>
+            <p>Running caller transcript, dispatcher transcript, and a lightly cleaned caller view</p>
+          </div>
+          <div class="dialogue-stack">
+            <section class="stream-panel">
+              <div class="stream-head">
+                <h3>Caller</h3>
+                <p>Append-only STT as heard</p>
+              </div>
+              <div id="caller-stream" class="stream-body">Waiting for caller audio.</div>
+            </section>
+
+            <section class="stream-panel">
+              <div class="stream-head">
+                <h3>Dispatcher</h3>
+                <p>Append-only TTS transcript as spoken</p>
+              </div>
+              <div id="agent-stream" class="stream-body">Waiting for dispatcher audio.</div>
+            </section>
+
+            <section class="stream-panel cleaned-panel">
+              <div class="stream-head">
+                <h3>Cleaned Caller</h3>
+                <p>Simple de-fluffed caller text for readability only</p>
+              </div>
+              <div id="cleaned-stream" class="stream-body">Waiting for cleaned caller text.</div>
+            </section>
+          </div>
+        </article>
+
+        <aside class="dashboard-stack secondary-stack">
+          <article class="card">
+            <div class="card-head">
+              <h2>Triage</h2>
+              <p>Structured SLM-shaped state, latest delta, and handoff readiness</p>
+            </div>
+            <div id="triage-panel" class="detail-panel">
+              <article class="entry event">
+                <div class="body">No triage state yet.</div>
+              </article>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h2>Ticket</h2>
+              <p>The latest generated dispatch ticket</p>
+            </div>
+            <div id="ticket-panel" class="detail-panel">
+              <article class="entry event">
+                <div class="body">No incident ticket yet.</div>
+              </article>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h2>Gradbot Tool Chain</h2>
+              <p>An operator-friendly view of the deterministic assist workflow</p>
+            </div>
+            <div id="tool-chain" class="tool-chain">
+              <article class="entry event">
+                <div class="body">No deterministic assist chain activity yet.</div>
+              </article>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h2>Tool Timeline</h2>
+              <p>Every tool call, its arguments, and its result</p>
+            </div>
+            <div id="tool-log" class="tool-log">
+              <article class="entry event">
+                <div class="body">No tool calls yet.</div>
+              </article>
+            </div>
+          </article>
+        </aside>
+      </section>
+
+      <section class="grid grid-wide">
+        <article class="card">
+          <div class="card-head">
+            <h2>Session Events</h2>
+            <p>Connection, turn, and error events</p>
+          </div>
+          <div id="event-log" class="log compact"></div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <h2>Session Memory</h2>
+            <p>The dialogue is synced while the call is live so it can be inspected after stop</p>
+          </div>
+          <div id="memory-panel" class="detail-panel">
+            <article class="entry event">
+              <div class="body">Start a call to populate the stored session state.</div>
+            </article>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <script src="/static/js/opus-encoder.js"></script>
+    <script src="/static/js/audio-processor.js"></script>
+    <script src="/static/js/synced-audio-player.js"></script>
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="/demo-static/app.js"></script>
+  </body>
+</html>
