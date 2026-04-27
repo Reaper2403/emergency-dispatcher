@@ -4,6 +4,8 @@ Realtime emergency-dispatch demo for noisy environments.
 
 Originally built during a hackathon, this repo is the working system that the later SLM + LLM grounding playbook was extracted from.
 
+The architectural pattern this project converged on — fast LLM voice lane plus slow SLM grounding lane around a shared ledger — is generalized in a separate playbook: [Reaper2403/slm-llm-grounding-playbook](https://github.com/Reaper2403/slm-llm-grounding-playbook).
+
 The project combines:
 - `ai-coustics` for live input enhancement
 - `Gradbot + Gradium` for the voice loop
