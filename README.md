@@ -2,6 +2,8 @@
 
 Realtime emergency-dispatch demo for noisy environments.
 
+Originally built during a hackathon, this repo is the working system that the later SLM + LLM grounding playbook was extracted from.
+
 The project combines:
 - `ai-coustics` for live input enhancement
 - `Gradbot + Gradium` for the voice loop
@@ -100,7 +102,7 @@ source .venv/bin/activate
 pip install -e .[dev]
 ```
 
-Create `.env` from [.env.example](/Users/ashutoshchatterjee/Documents/Hackathon/.env.example).
+Create `.env` from [.env.example](./.env.example).
 
 Minimum for the live app:
 
@@ -133,7 +135,7 @@ Important defaults already supported:
 Use this while actively testing calls:
 
 ```bash
-cd /Users/ashutoshchatterjee/Documents/Hackathon
+cd path/to/repo
 source .venv/bin/activate
 PYTHONPATH=src uvicorn emergency_dispatcher.server:app --host 127.0.0.1 --port 8001
 ```
@@ -149,7 +151,7 @@ Avoid `--reload` while generating datasets inside this repo. The file watcher ca
 Core provider check:
 
 ```bash
-cd /Users/ashutoshchatterjee/Documents/Hackathon
+cd path/to/repo
 source .venv/bin/activate
 PYTHONPATH=src python -m emergency_dispatcher.smoke
 ```
@@ -157,7 +159,7 @@ PYTHONPATH=src python -m emergency_dispatcher.smoke
 Test suite:
 
 ```bash
-cd /Users/ashutoshchatterjee/Documents/Hackathon
+cd path/to/repo
 source .venv/bin/activate
 PYTHONPATH=src pytest -q
 ```
@@ -218,7 +220,7 @@ Start Ollama:
 Generate a small validation batch first:
 
 ```bash
-cd /Users/ashutoshchatterjee/Documents/Hackathon
+cd path/to/repo
 source .venv/bin/activate
 python -u scripts/generate_slm_guidance_training_data.py --count 50
 ```
@@ -226,20 +228,20 @@ python -u scripts/generate_slm_guidance_training_data.py --count 50
 ### Fact-ledger dataset generation
 
 ```bash
-cd /Users/ashutoshchatterjee/Documents/Hackathon
+cd path/to/repo
 source .venv/bin/activate
 python -u scripts/generate_slm_fact_ledger_training_data.py --count 50
 ```
 
 ### Pioneer export helpers
 
-Use the `prepare_*`, `finalize_*`, and `export_*` scripts in [scripts](/Users/ashutoshchatterjee/Documents/Hackathon/scripts) once the local sample quality looks good.
+Use the `prepare_*`, `finalize_*`, and `export_*` scripts in [scripts](./scripts) once the local sample quality looks good.
 
 ## Current Documentation
 
 The repo keeps only the active markdown docs:
-- [README.md](/Users/ashutoshchatterjee/Documents/Hackathon/README.md): setup, architecture, runtime modes, and workflows
-- [prompts/dispatcher_system_prompt.md](/Users/ashutoshchatterjee/Documents/Hackathon/prompts/dispatcher_system_prompt.md): active dispatcher runtime instructions
+- [README.md](./README.md): setup, architecture, runtime modes, and workflows
+- [prompts/dispatcher_system_prompt.md](./prompts/dispatcher_system_prompt.md): active dispatcher runtime instructions
 
 ## Main Known Limits
 
