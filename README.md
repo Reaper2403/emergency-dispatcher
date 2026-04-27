@@ -140,10 +140,6 @@ source .venv/bin/activate
 PYTHONPATH=src uvicorn emergency_dispatcher.server:app --host 127.0.0.1 --port 8001
 ```
 
-Open:
-- [http://127.0.0.1:8001/demo](http://127.0.0.1:8001/demo)
-- [http://127.0.0.1:8001/review](http://127.0.0.1:8001/review)
-
 Avoid `--reload` while generating datasets inside this repo. The file watcher can restart the server mid-call.
 
 ## Smoke Checks
