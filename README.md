@@ -6,6 +6,11 @@ Originally built during a hackathon, this repo is the working system that the la
 
 The architectural pattern this project converged on — fast LLM voice lane plus slow SLM grounding lane around a shared ledger — is generalized in a separate playbook: [Reaper2403/slm-llm-grounding-playbook](https://github.com/Reaper2403/slm-llm-grounding-playbook).
 
+
+https://github.com/user-attachments/assets/f2ee3c60-c74e-4e77-944c-5098a3172fef
+
+
+
 The project combines:
 - `ai-coustics` for live input enhancement
 - `Gradbot + Gradium` for the voice loop
